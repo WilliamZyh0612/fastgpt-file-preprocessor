@@ -1,0 +1,8 @@
+{
+  "policy": {
+    "unknown_value": "待人工确认",
+    "source_files_read_only": true,
+    "similarity_threshold": 0.72
+  },
+  "notes": "当前版本使用可审计的本地规则提取；只会从文本证据中填值，缺失信息一律标记待人工确认。"
+}
