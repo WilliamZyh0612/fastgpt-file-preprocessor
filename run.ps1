@@ -3,4 +3,6 @@ param(
   [Parameter(Mandatory=$true)][string]$Output
 )
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
-& "$root\.venv\Scripts\python.exe" "$root\src\preprocessor.py" --input $Input --output $Output
+Push-Location $root
+try { & "$root\.venv\Scripts\python.exe" -m src.preprocessor --input $Input --output $Output --config "$root\config.json" }
+finally { Pop-Location }

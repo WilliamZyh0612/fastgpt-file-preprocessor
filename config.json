@@ -1,10 +1,10 @@
 {
   "unknown_value": "待人工确认",
-  "api_base_url": "https://your-openai-compatible-endpoint/v1",
+  "api_base_url": "",
   "api_key_env": "FASTGPT_PREPROCESSOR_API_KEY",
-  "text_model": "your-text-model",
-  "vision_model": "your-vision-model",
-  "embedding_model": "your-embedding-model",
+  "text_model": "",
+  "vision_model": "",
+  "embedding_model": "",
   "ai_enabled": false,
   "timeout_seconds": 45,
   "retries": 2,
@@ -15,6 +15,6 @@
   "min_pdf_text_chars": 80,
   "legacy_office_conversion_enabled": false,
   "legacy_office_timeout_seconds": 60,
-  "model_aliases": {"DC-260U": ["DC260U"]},
-  "cnc_aliases": {"FANUC": ["0i-MF"]}
+  "model_aliases": {},
+  "cnc_aliases": {}
 }

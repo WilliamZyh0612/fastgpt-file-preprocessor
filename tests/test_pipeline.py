@@ -24,7 +24,7 @@ class PipelineTests(unittest.TestCase):
             (source / "note.md").write_text("这是一般工作笔记。", encoding="utf-8")
             record = run(source, root / "output")[0]
             self.assertEqual(record.machine_model, UNKNOWN)
-            self.assertEqual(record.version, UNKNOWN)
+            self.assertEqual(record.version.value, UNKNOWN)
 
 
 if __name__ == "__main__": unittest.main()
