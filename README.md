@@ -26,7 +26,8 @@ AI 层要求 JSON Schema；非法 JSON、字段不合法或超时会重试，然
 cd E:\Codex工作区\FastGPT文件预处理器
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+pip install -r requirements.txt          # 运行依赖
+pip install -r requirements-dev.txt      # 测试依赖（含 reportlab）
 .\run.ps1 -Input 'D:\待处理资料' -Output 'D:\预处理结果'
 ```
 

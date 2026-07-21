@@ -12,7 +12,7 @@ from pathlib import Path
 from .ai import AIAnalyzer, AIResponseError
 from .config import Settings, load_settings
 from .dictionaries import CATEGORY_RULES, CNC_BRANDS, MACHINE_MODELS
-from .parsers import Evidence, Extracted, SUPPORTED, extract, sha256
+from .parsers import Evidence, Extracted, SUPPORTED, evidence, extract, sha256
 from .reports import write_reports
 
 STOPWORDS = {"的", "和", "及", "与", "在", "是", "为", "了", "本", "该", "产品", "文件", "说明", "manual", "the", "and", "for", "with", "this"}
@@ -59,6 +59,8 @@ class Record:
     text: str = field(default="", repr=False)
     evidence: list[Evidence] = field(default_factory=list, repr=False)
     tables: list[dict] = field(default_factory=list, repr=False)
+    ai_structured: dict = field(default_factory=dict)
+    conflicts: list[dict] = field(default_factory=list)
 
     @property
     def machine_model(self) -> str:
@@ -74,13 +76,14 @@ def unknown(settings: Settings, evidence: list[Evidence] | None = None) -> Field
 
 
 def find_models(context: str, evidence: list[Evidence], settings: Settings) -> list[FieldValue]:
-    aliases = {**MACHINE_MODELS, **settings.model_aliases}; matches = []
-    upper = context.upper()
+    aliases = {**MACHINE_MODELS, **settings.model_aliases}; hits: list[tuple[str, str]] = []
     for canonical, names in aliases.items():
-        if any(alias.upper() in upper for alias in names):
-            source = next((item for item in evidence if any(alias.upper() in item.excerpt.upper() for alias in names)), Evidence("路径或文件名", "名称", canonical))
-            matches.append(FieldValue(canonical, [source]))
-    return matches
+        for alias in names:
+            if re.search(rf"(?<![A-Z0-9-]){re.escape(alias)}(?![A-Z0-9-])", context, re.I): hits.append((canonical, alias)); break
+    chosen: list[tuple[str, str]] = []
+    for canonical, alias in sorted(hits, key=lambda item: len(item[1]), reverse=True):
+        if canonical not in [item[0] for item in chosen] and not any(alias.upper() in longer.upper() for _, longer in chosen): chosen.append((canonical, alias))
+    return [FieldValue(canonical, [next((e for e in evidence if re.search(rf"(?<![A-Z0-9-]){re.escape(alias)}(?![A-Z0-9-])", e.excerpt, re.I)), Evidence("name-context", "路径或文件名", "名称", alias))]) for canonical, alias in chosen]
 
 
 def find_cnc(context: str, evidence: list[Evidence], settings: Settings) -> list[dict]:
@@ -90,7 +93,7 @@ def find_cnc(context: str, evidence: list[Evidence], settings: Settings) -> list
         if matched:
             model = re.search(rf"{re.escape(matched)}\s*([0-9A-Z][0-9A-Z ._-]{{0,20}})?", context, re.I)
             item = model.group(0).strip() if model else settings.unknown_value
-            source = next((e for e in evidence if matched.upper() in e.excerpt.upper()), Evidence("路径或文件名", "名称", matched))
+            source = next((e for e in evidence if matched.upper() in e.excerpt.upper()), Evidence("name-context", "路径或文件名", "名称", matched))
             result.append({"brand": brand, "model": item, "version": settings.unknown_value, "evidence": [asdict(source)]})
     return result
 
@@ -98,7 +101,7 @@ def find_cnc(context: str, evidence: list[Evidence], settings: Settings) -> list
 def first_regex(pattern: str, context: str, evidence: list[Evidence], settings: Settings) -> FieldValue:
     matched = re.search(pattern, context, flags=re.I)
     if not matched: return unknown(settings)
-    value = matched.group(1).strip(); source = next((e for e in evidence if value.lower() in e.excerpt.lower()), Evidence("路径或文件名", "名称", value))
+    value = matched.group(1).strip(); source = next((e for e in evidence if value.lower() in e.excerpt.lower()), Evidence("name-context", "路径或文件名", "名称", value))
     return FieldValue(value, [source])
 
 
@@ -114,7 +117,7 @@ def summarize(text: str, evidence: list[Evidence], settings: Settings) -> tuple[
     if not sentences: return unknown(settings), [unknown(settings)], []
     ranked = sorted(sentences, key=lambda item: (sum(word in item.lower() for words in CATEGORY_RULES.values() for word in words), len(item)), reverse=True)
     selected = ranked[0][:300]
-    source = next((e for e in evidence if selected[:20] in e.excerpt), evidence[:1][0] if evidence else Evidence("", "", ""))
+    source = next((e for e in evidence if selected[:20] in e.excerpt), evidence[:1][0] if evidence else globals()["evidence"]("", "", ""))
     words = re.findall(r"[A-Za-z][A-Za-z0-9+._-]{2,}|[\u4e00-\u9fff]{2,}", text)
     keys = [word for word, _ in Counter(word for word in words if word.lower() not in STOPWORDS).most_common(10)]
     return FieldValue(selected, [source]), [FieldValue(item[:300], [next((e for e in evidence if item[:16] in e.excerpt), source)]) for item in ranked[:5]], keys
@@ -125,23 +128,37 @@ def rule_categories(context: str, evidence: list[Evidence]) -> list[Classificati
     for name, terms in CATEGORY_RULES.items():
         hits = [term for term in terms if term.lower() in context.lower()]
         if hits:
-            source = next((e for e in evidence if any(term.lower() in e.excerpt.lower() for term in hits)), Evidence("路径或文件名", "名称", hits[0]))
+            source = next((e for e in evidence if any(term.lower() in e.excerpt.lower() for term in hits)), globals()["evidence"]("路径或文件名", "名称", hits[0]))
             found.append(Classification(name, min(0.95, 0.55 + .1 * len(hits)), f"命中关键词：{'、'.join(hits)}", source))
     return found
 
 
 def apply_ai(record: Record, analyzer: AIAnalyzer, context: str, settings: Settings) -> None:
-    try: result = analyzer.analyze(context)
+    refs = [asdict(item) for item in record.evidence]
+    try: result = analyzer.analyze(context, refs)
     except AIResponseError as exc: record.errors.append(str(exc)); return
     if not result: return
-    categories = []
-    for item in result["categories"]:
-        if item["name"] == settings.unknown_value or not item["evidence"].strip(): continue
-        categories.append(Classification(item["name"], float(item["confidence"]), item["reason"], Evidence(record.filename, "AI 引用", item["evidence"][:500])))
-    if categories: record.categories = categories
-    if result["machine_models"]: record.machine_models = [FieldValue(value, [Evidence(record.filename, "AI 引用", value)]) for value in result["machine_models"] if value != settings.unknown_value]
-    if result["summary"] != settings.unknown_value: record.summary = FieldValue(result["summary"], [Evidence(record.filename, "AI 引用", result["summary"][:500])])
-    if result["keywords"]: record.keywords = result["keywords"][:10]
+    record.ai_structured = {key: result[key] for key in ("product_records", "fault_records", "part_records", "business_rule_records")}
+    meta = result["document_metadata"]; lookup = {item.evidence_id:item for item in record.evidence}
+    categories = [Classification(item["name"], float(item["confidence"]), item["reason"], lookup[item["evidence_refs"][0]]) for item in meta["categories"] if item["name"] != settings.unknown_value and item["evidence_refs"]]
+    if categories:
+        rule_names={x.name for x in record.categories}; ai_names={x.name for x in categories}
+        if rule_names and rule_names != ai_names: record.conflicts.append({"field":"categories","rule_value":sorted(rule_names),"ai_value":sorted(ai_names)}); record.review_status="待人工确认"
+        record.categories=categories
+    if meta["machine_models"]:
+        refs_for_model=[lookup[x] for x in meta["categories"][0]["evidence_refs"]] if meta["categories"] and meta["categories"][0]["evidence_refs"] else []
+        ai_models=[FieldValue(x,refs_for_model) for x in meta["machine_models"] if x!=settings.unknown_value]
+        if ai_models and record.machine_models and {x.value for x in ai_models}!={x.value for x in record.machine_models}: record.conflicts.append({"field":"machine_models","rule_value":[x.value for x in record.machine_models],"ai_value":[x.value for x in ai_models]}); record.review_status="待人工确认"
+        if ai_models: record.machine_models=ai_models
+    for field in ("visibility","version","release_date","summary"):
+        value=meta[field]
+        if value!=settings.unknown_value:
+            current=getattr(record,field); ai_field=FieldValue(value,[])
+            if current and current.value not in {settings.unknown_value,value}: record.conflicts.append({"field":field,"rule_value":current.value,"ai_value":value}); record.review_status="待人工确认"
+            setattr(record,field,ai_field)
+    if meta["cnc_systems"]: record.cnc_systems=meta["cnc_systems"]
+    if meta["knowledge_points"]: record.knowledge_points=[FieldValue(x,[]) for x in meta["knowledge_points"]]
+    if meta["keywords"]: record.keywords=meta["keywords"][:10]
 
 
 def analyze(path: Path, settings: Settings, analyzer: AIAnalyzer | None = None) -> Record:
@@ -162,7 +179,9 @@ def analyze(path: Path, settings: Settings, analyzer: AIAnalyzer | None = None) 
         record.release_date = first_regex(r"(?:发布日期|发布|日期|date)\s*[:：]?\s*((?:20\d{2}|19\d{2})[-/.年]\d{1,2}[-/.月]\d{1,2}日?)", context, parsed.evidence, settings)
         record.visibility = first_regex(r"(?:可见范围|保密级别|visibility)\s*[:：]?\s*(内部|公开|销售|售后|管理层|客户|public|internal)", context, parsed.evidence, settings)
         record.summary, record.knowledge_points, record.keywords = summarize(parsed.text, parsed.evidence, settings)
-        if analyzer: apply_ai(record, analyzer, context, settings)
+        if analyzer:
+            for chunk in parsed.chunks or [parsed.evidence]:
+                apply_ai(record, analyzer, "\n".join(item.excerpt for item in chunk), settings)
         category = record.categories[0].name if record.categories else "待分类"; model = record.machine_models[0].value if record.machine_models else settings.unknown_value
         record.archive_suggestion = f"/{category}/{model}/{record.release_date.value if record.release_date else settings.unknown_value}"
     except Exception as exc:

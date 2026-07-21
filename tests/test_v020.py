@@ -36,13 +36,19 @@ class V020Tests(unittest.TestCase):
     def test_scanned_pdf_falls_back_without_fabrication(self):
         source, _ = self._root(); path = source / "scan.pdf"; page = canvas.Canvas(str(path)); page.rect(20, 20, 200, 100); page.save()
         result = extract(path, self.settings)
-        self.assertTrue(result.ocr_attempted); self.assertIn("未配置视觉服务", result.errors[0])
+        self.assertTrue(result.ocr_attempted); self.assertIn("未配置或未完成", result.errors[0])
 
     def test_chinese_models_cnc_and_filename_detection(self):
         source, _ = self._root(); path = source / "新代_DC260U_维修.txt"; path.write_text("广数系统故障处理", encoding="utf-8")
         record = analyze(path, self.settings)
         self.assertEqual([m.value for m in record.machine_models], ["DC-260U"])
         self.assertEqual({x["brand"] for x in record.cnc_systems}, {"广数", "新代"})
+
+    def test_model_aliases_do_not_match_parent_models(self):
+        source, _ = self._root()
+        for text, expected in [("BS712-N 配件", "BS712-N"), ("BS712-R 配件", "BS712-R"), ("BS1018-B 参数", "BS1018-B"), ("DC 260U", "DC-260U"), ("Y5125B CNC", "Y5125B CNC")]:
+            path=source / f"{expected}.txt"; path.write_text(text,encoding="utf-8")
+            self.assertEqual([x.value for x in analyze(path,self.settings).machine_models],[expected])
 
     def test_multilabel_and_decimal_versions_are_not_sentence_split(self):
         source, _ = self._root(); path = source / "manual.txt"; path.write_text("BK5030 产品参数、操作说明、维修报警和配件清单。版本：V1.2。精度 0.01mm，圆度 3.14。", encoding="utf-8")
@@ -79,8 +85,9 @@ class V020Tests(unittest.TestCase):
         def delayed(_):
             calls["count"] += 1
             if calls["count"] < 2: raise TimeoutError("timeout")
-            return {"choices": [{"message": {"content": json.dumps({"summary":"x", "keywords":[], "categories":[], "machine_models":[], "cnc_systems":[], "visibility":"待人工确认", "version":"待人工确认", "release_date":"待人工确认", "knowledge_points":[]})}}]}
-        self.assertEqual(AIAnalyzer(Settings(ai_enabled=True, api_base_url="http://test/v1", text_model="test", retries=1), delayed).analyze("text")["summary"], "x")
+            data={"document_metadata":{"categories":[],"machine_models":[],"cnc_systems":[],"visibility":"待人工确认","version":"待人工确认","release_date":"待人工确认","summary":"x","knowledge_points":[],"keywords":[]},"product_records":[],"fault_records":[],"part_records":[],"business_rule_records":[]}
+            return {"choices": [{"message": {"content": json.dumps(data)}}]}
+        self.assertEqual(AIAnalyzer(Settings(ai_enabled=True, api_base_url="http://test/v1", text_model="test", retries=1), delayed).analyze("text")["document_metadata"]["summary"], "x")
         self.assertEqual(calls["count"], 2)
 
     def test_legacy_office_requires_safe_conversion(self):

@@ -15,6 +15,10 @@
   "min_pdf_text_chars": 80,
   "legacy_office_conversion_enabled": false,
   "legacy_office_timeout_seconds": 60,
+  "chunk_size_chars": 12000,
+  "chunk_overlap_chars": 400,
+  "embedding_batch_size": 32,
+  "ai_schema_mode": "strict",
   "model_aliases": {"DC-260U": ["DC260U"]},
   "cnc_aliases": {"FANUC": ["0i-MF"]}
 }
