@@ -21,7 +21,9 @@ SUPPORTED = {".pdf", ".docx", ".xlsx", ".xlsm", ".pptx", ".txt", ".md", ".markdo
 
 def extract_copies(archive: Path, destination: Path) -> list[Path]:
     if destination.exists(): raise FileExistsError(f"为避免覆盖已有副本，解压目录必须不存在：{destination}")
-    with zipfile.ZipFile(archive) as bundle:
+    # Most Chinese Windows ZIP tools write legacy filenames without the UTF-8
+    # flag.  metadata_encoding affects only those entries, not UTF-8 entries.
+    with zipfile.ZipFile(archive, metadata_encoding="gbk") as bundle:
         entries = [item for item in bundle.infolist() if not item.is_dir()]
         if any(PurePosixPath(item.filename).is_absolute() or ".." in PurePosixPath(item.filename).parts for item in entries):
             raise ValueError("ZIP 包含不安全路径，已拒绝解压")
