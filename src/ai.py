@@ -2,6 +2,8 @@ from __future__ import annotations
 import json, re, time, urllib.error, urllib.request
 from datetime import datetime
 from dataclasses import dataclass
+from dataclasses import field
+from threading import Lock
 from typing import Callable
 from .config import Settings
 
@@ -89,6 +91,8 @@ def validate_ai_result(value: object, evidence_ids: set[str] | None = None) -> d
 class AIAnalyzer:
     settings: Settings
     transport: Callable[[dict],dict]|None=None
+    usage: dict[str, int] = field(default_factory=lambda: {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
+    _usage_lock: Lock = field(default_factory=Lock, repr=False)
     def analyze(self, context: str, evidence_items: list[dict]|None=None) -> dict|None:
         if not self.settings.ai_enabled or not self.settings.api_base_url or not self.settings.text_model:return None
         ids={x["evidence_id"] for x in evidence_items or []}; last=None
@@ -96,6 +100,7 @@ class AIAnalyzer:
             try:
                 payload=self._payload(context,evidence_items or [])
                 response=self.transport(payload) if self.transport else self._request(payload)
+                self._record_usage(response.get("usage", {}))
                 return validate_ai_result(json.loads(response["choices"][0]["message"]["content"]),ids)
             except (KeyError,TypeError,json.JSONDecodeError,urllib.error.URLError,TimeoutError,AIResponseError) as exc:
                 last=exc
@@ -110,6 +115,12 @@ class AIAnalyzer:
         if self.settings.api_key:headers["Authorization"]=f"Bearer {self.settings.api_key}"
         request=urllib.request.Request(self.settings.api_base_url.rstrip("/")+"/chat/completions",data=json.dumps(payload).encode(),headers=headers,method="POST")
         with urllib.request.urlopen(request,timeout=self.settings.timeout_seconds) as response:return json.loads(response.read().decode())
+    def _record_usage(self, usage: object) -> None:
+        if not isinstance(usage, dict): return
+        with self._usage_lock:
+            for key in self.usage:
+                value = usage.get(key, 0)
+                if isinstance(value, int) and value >= 0: self.usage[key] += value
     def embeddings(self,texts):
         if not self.settings.semantic_similarity_enabled or not self.settings.api_base_url or not self.settings.embedding_model:return None
         all_vectors=[]

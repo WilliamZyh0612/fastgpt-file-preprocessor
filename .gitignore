@@ -4,3 +4,7 @@ __pycache__/
 *.pyc
 outputs/
 dist/
+测试文件.zip
+private-test-input/
+private-test-output/
+private-test-work/

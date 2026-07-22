@@ -61,6 +61,7 @@ class Record:
     evidence: list[Evidence] = field(default_factory=list, repr=False)
     tables: list[dict] = field(default_factory=list, repr=False)
     ai_structured: dict = field(default_factory=dict)
+    metadata_candidates: dict[str, list[FieldValue]] = field(default_factory=dict)
     conflicts: list[dict] = field(default_factory=list)
 
     @property
@@ -134,6 +135,49 @@ def rule_categories(context: str, evidence: list[Evidence]) -> list[Classificati
     return found
 
 
+def _merge_evidence(left: list[Evidence], right: list[Evidence]) -> list[Evidence]:
+    return list({item.evidence_id: item for item in [*left, *right]}.values())
+
+
+def _merge_field_values(existing: list[FieldValue], incoming: list[FieldValue]) -> list[FieldValue]:
+    merged: dict[str, FieldValue] = {item.value: FieldValue(item.value, list(item.evidence)) for item in existing}
+    for item in incoming:
+        if item.value in merged: merged[item.value].evidence = _merge_evidence(merged[item.value].evidence, item.evidence)
+        else: merged[item.value] = FieldValue(item.value, list(item.evidence))
+    return list(merged.values())
+
+
+def _add_conflict(record: Record, field: str, rule_value, ai_value) -> None:
+    conflict = {"field": field, "rule_value": rule_value, "ai_value": ai_value}
+    if conflict not in record.conflicts: record.conflicts.append(conflict)
+    record.review_status = "待人工确认"
+
+
+def _add_metadata_candidate(record: Record, field: str, value: FieldValue, settings: Settings) -> None:
+    candidates = record.metadata_candidates.setdefault(field, [])
+    current = getattr(record, field)
+    if current and current.value != settings.unknown_value:
+        candidates = _merge_field_values(candidates, [current])
+    if value.value != settings.unknown_value:
+        candidates = _merge_field_values(candidates, [value])
+    record.metadata_candidates[field] = candidates
+
+
+def _finalize_document_metadata(record: Record, settings: Settings) -> None:
+    for field in ("version", "release_date", "visibility", "summary"):
+        candidates = record.metadata_candidates.get(field, [])
+        if not candidates: continue
+        if field == "summary":
+            text = "；".join(item.value for item in candidates)
+            record.summary = FieldValue(text[:4000], _merge_evidence([], [evidence for item in candidates for evidence in item.evidence]))
+            continue
+        if len(candidates) == 1:
+            setattr(record, field, candidates[0]); continue
+        all_evidence = _merge_evidence([], [evidence for item in candidates for evidence in item.evidence])
+        _add_conflict(record, field, [item.value for item in candidates], [item.value for item in candidates])
+        setattr(record, field, FieldValue(settings.unknown_value, all_evidence))
+
+
 def apply_ai(record: Record, analyzer: AIAnalyzer, context: str, settings: Settings, chunk: list[Evidence]) -> None:
     refs = [asdict(item) for item in chunk]
     try: result = analyzer.analyze(context, refs)
@@ -148,24 +192,30 @@ def apply_ai(record: Record, analyzer: AIAnalyzer, context: str, settings: Setti
         if not ref_ids or not set(ref_ids).issubset(lookup): raise AIResponseError("AI 字段引用了当前分块以外的证据")
         return [lookup[item] for item in ref_ids]
     categories = [Classification(item["name"], float(item["confidence"]), item["reason"], lookup[item["evidence_refs"][0]]) for item in meta["categories"] if item["name"] != settings.unknown_value and item["evidence_refs"]]
-    if categories:
-        rule_names={x.name for x in record.categories}; ai_names={x.name for x in categories}
-        if rule_names and rule_names != ai_names: record.conflicts.append({"field":"categories","rule_value":sorted(rule_names),"ai_value":sorted(ai_names)}); record.review_status="待人工确认"
-        record.categories=categories
+    by_name = {item.name: item for item in record.categories}
+    for item in categories:
+        if item.name not in by_name or item.confidence > by_name[item.name].confidence: by_name[item.name] = item
+    record.categories = list(by_name.values())
     if meta["machine_models"]:
         ai_models=[FieldValue(item["value"], cited(item["evidence_refs"])) for item in meta["machine_models"] if item["value"] != settings.unknown_value]
-        if ai_models and record.machine_models and {x.value for x in ai_models}!={x.value for x in record.machine_models}: record.conflicts.append({"field":"machine_models","rule_value":[x.value for x in record.machine_models],"ai_value":[x.value for x in ai_models]}); record.review_status="待人工确认"
-        if ai_models: record.machine_models=ai_models
+        rule_models = [item.value for item in record.machine_models]
+        new_models = [item.value for item in ai_models if item.value not in rule_models]
+        if rule_models and new_models: _add_conflict(record, "machine_models", rule_models, [item.value for item in ai_models])
+        if ai_models: record.machine_models = _merge_field_values(record.machine_models, ai_models)
     for field in ("visibility","version","release_date","summary"):
         value=meta[field]["value"]
         if value!=settings.unknown_value:
-            current=getattr(record,field); ai_field=FieldValue(value, cited(meta[field]["evidence_refs"]))
-            if current and current.value not in {settings.unknown_value,value}: record.conflicts.append({"field":field,"rule_value":current.value,"ai_value":value}); record.review_status="待人工确认"
-            setattr(record,field,ai_field)
+            _add_metadata_candidate(record, field, FieldValue(value, cited(meta[field]["evidence_refs"])), settings)
     if meta["cnc_systems"]:
-        record.cnc_systems=[{**item, "evidence":[asdict(source) for source in cited(item["evidence_refs"])]} for item in meta["cnc_systems"]]
-    if meta["knowledge_points"]: record.knowledge_points=[FieldValue(item["value"], cited(item["evidence_refs"])) for item in meta["knowledge_points"]]
-    if meta["keywords"]: record.keywords=[item["value"] for item in meta["keywords"][:10]]
+        systems = [{**item, "evidence":[asdict(source) for source in cited(item["evidence_refs"])]} for item in meta["cnc_systems"]]
+        merged = {(item["brand"], item["model"], item["version"]): item for item in record.cnc_systems}
+        for item in systems:
+            key = (item["brand"], item["model"], item["version"])
+            if key in merged: merged[key]["evidence"] = {source["evidence_id"]: source for source in [*merged[key].get("evidence", []), *item["evidence"]]}.values()
+            else: merged[key] = item
+        record.cnc_systems = [dict(item, evidence=list(item.get("evidence", []))) for item in merged.values()]
+    if meta["knowledge_points"]: record.knowledge_points = _merge_field_values(record.knowledge_points, [FieldValue(item["value"], cited(item["evidence_refs"])) for item in meta["knowledge_points"]])
+    if meta["keywords"]: record.keywords = list(dict.fromkeys([*record.keywords, *(item["value"] for item in meta["keywords"])]))[:30]
 
 
 def _aggregate_ai_structured(record: Record) -> None:
@@ -218,8 +268,10 @@ def analyze(path: Path, settings: Settings, analyzer: AIAnalyzer | None = None) 
         record.visibility = first_regex(r"(?:可见范围|保密级别|visibility)\s*[:：]?\s*(内部|公开|销售|售后|管理层|客户|public|internal)", context, parsed.evidence, settings)
         record.summary, record.knowledge_points, record.keywords = summarize(parsed.text, parsed.evidence, settings)
         if analyzer:
+            record.evidence = list({item.evidence_id: item for item in [*record.evidence, *(item for chunk in parsed.chunks for item in chunk)]}.values())
             for chunk in parsed.chunks or [parsed.evidence]:
                 apply_ai(record, analyzer, "\n".join(item.excerpt for item in chunk), settings, chunk)
+            _finalize_document_metadata(record, settings)
             _aggregate_ai_structured(record)
         category = record.categories[0].name if record.categories else "待分类"; model = record.machine_models[0].value if record.machine_models else settings.unknown_value
         record.archive_suggestion = f"/{category}/{model}/{record.release_date.value if record.release_date else settings.unknown_value}"

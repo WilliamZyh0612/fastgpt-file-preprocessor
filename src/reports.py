@@ -10,6 +10,7 @@ from .config import Settings
 
 def _value(field, unknown): return field.value if field else unknown
 def _evidence(field): return "；".join(f"{item.source} {item.location}: {item.excerpt}" for item in (field.evidence if field else []))
+def _candidates(record, field, unknown): return "、".join(item.value for item in record.metadata_candidates.get(field, [])) or _value(getattr(record, field), unknown)
 def _save(path: Path, headers: list[str], rows: list[list[str]]) -> None:
     book = Workbook(); sheet = book.active; sheet.title = "数据"; sheet.append(headers)
     for row in rows: sheet.append(row)
@@ -23,8 +24,8 @@ def _save(path: Path, headers: list[str], rows: list[list[str]]) -> None:
 
 def write_reports(records, output: Path, settings: Settings) -> None:
     output.mkdir(parents=True, exist_ok=True); unknown = settings.unknown_value
-    catalog = [[r.filename, r.path, r.extension, r.sha256, r.normalized_text_hash, "、".join(c.name for c in r.categories) or unknown, "、".join(m.value for m in r.machine_models) or unknown, "、".join(x["brand"] for x in r.cnc_systems) or unknown, _value(r.version, unknown), _value(r.release_date, unknown), _value(r.visibility, unknown), _value(r.summary, unknown), "；".join(x.value for x in r.knowledge_points), "、".join(r.keywords), r.archive_suggestion, r.review_status, r.extraction_status, "；".join(r.flags), "；".join(r.errors)] for r in records]
-    _save(output / "FastGPT知识库总目录.xlsx", ["文件名", "原始路径", "类型", "SHA-256", "标准化文本哈希", "文件类别", "适用机型", "数控系统品牌", "版本", "日期", "可见范围", "摘要", "核心知识点", "关键词", "建议归档目录", "审核状态", "提取状态", "风险标记", "错误原因"], catalog)
+    catalog = [[r.filename, r.path, r.extension, r.sha256, r.normalized_text_hash, "、".join(c.name for c in r.categories) or unknown, "、".join(m.value for m in r.machine_models) or unknown, "、".join(x["brand"] for x in r.cnc_systems) or unknown, _value(r.version, unknown), _candidates(r, "version", unknown), _value(r.release_date, unknown), _candidates(r, "release_date", unknown), _value(r.visibility, unknown), _candidates(r, "visibility", unknown), _value(r.summary, unknown), "；".join(x.value for x in r.knowledge_points), "、".join(r.keywords), r.archive_suggestion, r.review_status, r.extraction_status, "；".join(r.flags), "；".join(r.errors)] for r in records]
+    _save(output / "FastGPT知识库总目录.xlsx", ["文件名", "原始路径", "类型", "SHA-256", "标准化文本哈希", "文件类别", "适用机型", "数控系统品牌", "版本", "版本候选值", "日期", "日期候选值", "可见范围", "可见范围候选值", "摘要", "核心知识点", "关键词", "建议归档目录", "审核状态", "提取状态", "风险标记", "错误原因"], catalog)
     def trail(record, item):
         refs = {e.evidence_id:e for e in record.evidence}; cited = [refs[x] for x in item.get("evidence_refs",[]) if x in refs]
         return [record.filename, "；".join(f"{e.location}" for e in cited), "；".join(e.excerpt for e in cited), item.get("confidence",0), record.review_status, "；".join(str(x) for x in record.conflicts) or "无"]

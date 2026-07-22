@@ -121,18 +121,37 @@ def _pptx(path: Path, settings: Settings) -> Extracted:
 
 
 def _chunk_evidence(items: list[Evidence], size: int, overlap: int = 0) -> list[list[Evidence]]:
-    # A single long paragraph/cell/page must not bypass the configured chunk size.
-    expanded: list[Evidence] = []
-    stride = max(1, size - overlap)
-    for item in items:
-        if len(item.excerpt) <= size:
-            expanded.append(item); continue
-        for start in range(0, len(item.excerpt), stride):
-            expanded.append(evidence(item.source, f"{item.location} 片段 {start // stride + 1}", item.excerpt[start:start + size]))
-    groups: list[list[Evidence]] = []; current: list[Evidence] = []; count = 0
-    for item in expanded:
-        if current and count + len(item.excerpt) > size:
-            groups.append(current); current = current[-1:] if overlap else []; count = sum(len(x.excerpt) for x in current)
-        current.append(item); count += len(item.excerpt)
+    """Split by actual character count, retaining an exact textual overlap.
+
+    Evidence may originate from a page, heading, row or table cell.  When a
+    boundary cuts one of these sources, a new evidence fragment retains its
+    source and location.  Therefore every AI request remains auditable while
+    no request exceeds ``size`` characters.
+    """
+    if size < 1 or overlap < 0 or overlap >= size: raise ValueError("分块大小或重叠长度不合法")
+
+    def tail(group: list[Evidence]) -> list[Evidence]:
+        remaining = overlap; selected: list[Evidence] = []
+        for item in reversed(group):
+            if remaining <= 0: break
+            text = item.excerpt[-remaining:]
+            selected.append(evidence(item.source, f"{item.location} 重叠片段", text))
+            remaining -= len(text)
+        return list(reversed(selected))
+
+    groups: list[list[Evidence]] = []; current: list[Evidence] = []; used = 0
+    for original in items:
+        text = original.excerpt; start = 0; part = 1
+        while start < len(text) or (not text and not current and not groups):
+            if used == size:
+                groups.append(current); current = tail(current); used = sum(len(item.excerpt) for item in current)
+            take = min(size - used, len(text) - start)
+            if take <= 0: break
+            excerpt = text[start:start + take]
+            location = original.location if start == 0 and take == len(text) else f"{original.location} 片段 {part}"
+            current.append(original if location == original.location else evidence(original.source, location, excerpt))
+            used += take; start += take; part += 1
+            if used == size and start < len(text):
+                groups.append(current); current = tail(current); used = sum(len(item.excerpt) for item in current)
     if current: groups.append(current)
-    return groups or ([expanded] if expanded else [])
+    return groups

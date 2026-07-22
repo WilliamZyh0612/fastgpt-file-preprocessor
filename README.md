@@ -50,3 +50,14 @@ $env:PYTHONPATH='.'
 ```
 
 测试包会生成在 `dist\fastgpt-file-preprocessor.zip`。详见 [架构说明](ARCHITECTURE.md)。
+
+## 脱敏真实资料预试跑
+
+将脱敏副本放在根目录的 `测试文件.zip` 后执行：
+
+```powershell
+$env:PYTHONPATH='.'
+.\.venv\Scripts\python.exe tools\private_trial.py
+```
+
+该工具只解压到 `private-test-input`，输出只写到 `private-test-output`；这两个目录、ZIP、解析文本和报表均在 `.gitignore` 中，绝不提交 GitHub。试跑要求 10–20 份资料；少于 10 份时仅可使用 `--allow-under-minimum` 做预试跑。模型默认关闭；若启用 AI，需在 `config.json` 配置单价，服务端返回 usage 后才会给出费用估算。分类与型号准确率必须依据输出的 `人工审核标注模板.csv` 人工核验，工具不会编造准确率。

@@ -13,19 +13,19 @@ from openpyxl import load_workbook
 from src.ai import AI_SCHEMA, AIAnalyzer, validate_ai_result
 from src.config import Settings, load_settings
 from src.parsers import _chunk_evidence, evidence, extract
-from src.preprocessor import Record, analyze, enrich
+from src.preprocessor import Record, _finalize_document_metadata, analyze, apply_ai, enrich
 from src.reports import write_reports
 
 
-def structured_result(evidence_id: str, product_name: str = "BK5030 选型") -> dict:
+def structured_result(evidence_id: str, product_name: str = "BK5030 选型", *, category: str = "产品资料", model: str = "BK5030", version: str = "V1.2", date: str = "2025-01-01", visibility: str = "内部", summary: str = "BK5030 产品参数说明", keyword: str = "BK5030", knowledge: str = "加工范围 500mm", cnc_brand: str = "FANUC") -> dict:
     def field(value: str) -> dict:
         return {"value": value, "confidence": .9, "evidence_refs": [evidence_id]}
     metadata = {
-        "categories": [{"name": "产品资料", "confidence": .9, "reason": "参数表", "evidence_refs": [evidence_id]}],
-        "machine_models": [field("BK5030")],
-        "cnc_systems": [{"brand": "FANUC", "model": "0i-MF", "version": "待人工确认", "confidence": .8, "evidence_refs": [evidence_id]}],
-        "visibility": field("内部"), "version": field("V1.2"), "release_date": field("2025-01-01"),
-        "summary": field("BK5030 产品参数说明"), "knowledge_points": [field("加工范围 500mm")], "keywords": [field("BK5030")],
+        "categories": [{"name": category, "confidence": .9, "reason": "参数表", "evidence_refs": [evidence_id]}],
+        "machine_models": [field(model)],
+        "cnc_systems": [{"brand": cnc_brand, "model": "0i-MF", "version": "待人工确认", "confidence": .8, "evidence_refs": [evidence_id]}],
+        "visibility": field(visibility), "version": field(version), "release_date": field(date),
+        "summary": field(summary), "knowledge_points": [field(knowledge)], "keywords": [field(keyword)],
     }
     product = {"product_model": "BK5030", "product_name": product_name, "processing_object": "齿轮", "processing_range": "500mm", "key_parameters": "行程 500mm", "accuracy": "0.01mm", "standard_configuration": "标准夹具", "optional_configuration": "自动上下料", "applicable_scenarios": "批量加工", "limitations": "需人工确认", "cnc_system": "FANUC 0i-MF", "evidence_refs": [evidence_id], "confidence": .9}
     return {"document_metadata": metadata, "product_records": [product], "fault_records": [], "part_records": [], "business_rule_records": []}
@@ -53,7 +53,7 @@ class FixTests(unittest.TestCase):
     def test_last_chunk_and_configured_overlap_are_effective(self):
         parts = [evidence("x", str(i), "a" * 8) for i in range(3)]
         chunks = _chunk_evidence(parts, 12, 4)
-        self.assertEqual(chunks[-1][-1].evidence_id, parts[-1].evidence_id)
+        self.assertTrue("".join(item.excerpt for item in chunks[-1]).endswith(parts[-1].excerpt[-4:]))
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "long.txt"; path.write_text("a" * 1200, encoding="utf-8")
             config = Path(tmp) / "config.json"; config.write_text(json.dumps({"chunk_size_chars": 500, "chunk_overlap_chars": 100}), encoding="utf-8")
@@ -72,8 +72,36 @@ class FixTests(unittest.TestCase):
         self.assertGreater(len(calls), 1)
         self.assertEqual(len(record.ai_structured["product_records"]), len(calls))
         for source in calls:
-            self.assertEqual(len(source["evidence"]), 1)
-            self.assertIn(source["evidence"][0]["excerpt"], source["context"])
+            self.assertLessEqual(sum(len(item["excerpt"]) for item in source["evidence"]), 500)
+            self.assertTrue(all(item["excerpt"] in source["context"] for item in source["evidence"]))
+
+    def test_document_metadata_is_merged_across_chunks(self):
+        first, second = evidence("x", "第1页", "first"), evidence("x", "第2页", "second")
+        def transport(payload):
+            current = json.loads(payload["messages"][1]["content"]); ref = current["evidence"][0]["evidence_id"]
+            if "second" in current["context"]:
+                value = structured_result(ref, category="操作资料", model="TCK56", version="V2.0", date="2025-02-01", visibility="公开", summary="第二分块摘要", keyword="操作", knowledge="安全操作", cnc_brand="西门子")
+            else:
+                value = structured_result(ref, category="产品资料", model="BK5030", version="V1.0", date="2025-01-01", visibility="内部", summary="第一分块摘要", keyword="参数", knowledge="加工范围")
+            return {"choices": [{"message": {"content": json.dumps(value, ensure_ascii=False)}}]}
+        settings = Settings(ai_enabled=True, api_base_url="http://x/v1", text_model="m")
+        record = Record("x", "x.txt", ".txt", "hash", 1, evidence=[first, second])
+        analyzer = AIAnalyzer(settings, transport)
+        apply_ai(record, analyzer, "first", settings, [first]); apply_ai(record, analyzer, "second", settings, [second]); _finalize_document_metadata(record, settings)
+        self.assertEqual({item.name for item in record.categories}, {"产品资料", "操作资料"})
+        self.assertEqual({item.value for item in record.machine_models}, {"BK5030", "TCK56"})
+        self.assertEqual({item["brand"] for item in record.cnc_systems}, {"FANUC", "西门子"})
+        self.assertEqual(set(record.keywords), {"参数", "操作"}); self.assertEqual({item.value for item in record.knowledge_points}, {"加工范围", "安全操作"})
+        self.assertEqual(record.version.value, "待人工确认"); self.assertEqual({item.value for item in record.metadata_candidates["version"]}, {"V1.0", "V2.0"})
+        self.assertEqual(record.release_date.value, "待人工确认"); self.assertEqual(record.visibility.value, "待人工确认")
+        self.assertIn("第一分块摘要", record.summary.value); self.assertIn("第二分块摘要", record.summary.value)
+
+    def test_chunk_overlap_is_exact_and_chunk_size_is_never_exceeded(self):
+        chunks = _chunk_evidence([evidence("x", "正文", "abcdefghijklmnopqrstuvwxyz")], 10, 3)
+        text = lambda group: "".join(item.excerpt for item in group)
+        self.assertTrue(all(len(text(group)) <= 10 for group in chunks))
+        self.assertEqual(text(chunks[0])[-3:], text(chunks[1])[:3])
+        self.assertEqual(text(chunks[1])[-3:], text(chunks[2])[:3])
 
     def test_ai_metadata_requires_current_nonempty_evidence(self):
         item = evidence("x", "第1页", "BK5030 产品参数")

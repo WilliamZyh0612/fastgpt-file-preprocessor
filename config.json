@@ -19,6 +19,8 @@
   "chunk_overlap_chars": 400,
   "embedding_batch_size": 32,
   "ai_schema_mode": "strict",
+  "input_token_price_per_million": 0.0,
+  "output_token_price_per_million": 0.0,
   "model_aliases": {},
   "cnc_aliases": {}
 }

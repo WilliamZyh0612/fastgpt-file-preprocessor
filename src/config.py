@@ -28,6 +28,8 @@ class Settings:
     chunk_overlap_chars: int = 400
     embedding_batch_size: int = 32
     ai_schema_mode: str = "strict"
+    input_token_price_per_million: float = 0.0
+    output_token_price_per_million: float = 0.0
     model_aliases: dict[str, list[str]] = field(default_factory=dict)
     cnc_aliases: dict[str, list[str]] = field(default_factory=dict)
 
@@ -47,6 +49,6 @@ def load_settings(path: Path | None = None) -> Settings:
     allowed = {field.name for field in Settings.__dataclass_fields__.values()}
     data = {key: value for key, value in raw.items() if key in allowed}
     settings = Settings(**data)
-    if settings.timeout_seconds < 1 or settings.concurrency < 1 or settings.chunk_size_chars < 500 or not 0 < settings.similarity_threshold <= 1 or settings.ai_schema_mode not in {"strict", "compat"}:
+    if settings.timeout_seconds < 1 or settings.concurrency < 1 or settings.chunk_size_chars < 500 or not 0 <= settings.chunk_overlap_chars < settings.chunk_size_chars or settings.input_token_price_per_million < 0 or settings.output_token_price_per_million < 0 or not 0 < settings.similarity_threshold <= 1 or settings.ai_schema_mode not in {"strict", "compat"}:
         raise ValueError("超时、并发或相似度阈值配置不合法")
     return settings
