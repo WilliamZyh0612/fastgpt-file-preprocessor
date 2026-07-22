@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import re
+from datetime import datetime
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
@@ -133,32 +134,69 @@ def rule_categories(context: str, evidence: list[Evidence]) -> list[Classificati
     return found
 
 
-def apply_ai(record: Record, analyzer: AIAnalyzer, context: str, settings: Settings) -> None:
-    refs = [asdict(item) for item in record.evidence]
+def apply_ai(record: Record, analyzer: AIAnalyzer, context: str, settings: Settings, chunk: list[Evidence]) -> None:
+    refs = [asdict(item) for item in chunk]
     try: result = analyzer.analyze(context, refs)
     except AIResponseError as exc: record.errors.append(str(exc)); return
     if not result: return
-    record.ai_structured = {key: result[key] for key in ("product_records", "fault_records", "part_records", "business_rule_records")}
-    meta = result["document_metadata"]; lookup = {item.evidence_id:item for item in record.evidence}
+    for key in ("product_records", "fault_records", "part_records", "business_rule_records"):
+        record.ai_structured.setdefault(key, []).extend(result[key])
+    meta = result["document_metadata"]; lookup = {item.evidence_id:item for item in chunk}
+    def cited(ref_ids: list[str]) -> list[Evidence]:
+        # validate_ai_result already checks existence; this second lookup protects
+        # against accidental use of evidence from a different document chunk.
+        if not ref_ids or not set(ref_ids).issubset(lookup): raise AIResponseError("AI 字段引用了当前分块以外的证据")
+        return [lookup[item] for item in ref_ids]
     categories = [Classification(item["name"], float(item["confidence"]), item["reason"], lookup[item["evidence_refs"][0]]) for item in meta["categories"] if item["name"] != settings.unknown_value and item["evidence_refs"]]
     if categories:
         rule_names={x.name for x in record.categories}; ai_names={x.name for x in categories}
         if rule_names and rule_names != ai_names: record.conflicts.append({"field":"categories","rule_value":sorted(rule_names),"ai_value":sorted(ai_names)}); record.review_status="待人工确认"
         record.categories=categories
     if meta["machine_models"]:
-        refs_for_model=[lookup[x] for x in meta["categories"][0]["evidence_refs"]] if meta["categories"] and meta["categories"][0]["evidence_refs"] else []
-        ai_models=[FieldValue(x,refs_for_model) for x in meta["machine_models"] if x!=settings.unknown_value]
+        ai_models=[FieldValue(item["value"], cited(item["evidence_refs"])) for item in meta["machine_models"] if item["value"] != settings.unknown_value]
         if ai_models and record.machine_models and {x.value for x in ai_models}!={x.value for x in record.machine_models}: record.conflicts.append({"field":"machine_models","rule_value":[x.value for x in record.machine_models],"ai_value":[x.value for x in ai_models]}); record.review_status="待人工确认"
         if ai_models: record.machine_models=ai_models
     for field in ("visibility","version","release_date","summary"):
-        value=meta[field]
+        value=meta[field]["value"]
         if value!=settings.unknown_value:
-            current=getattr(record,field); ai_field=FieldValue(value,[])
+            current=getattr(record,field); ai_field=FieldValue(value, cited(meta[field]["evidence_refs"]))
             if current and current.value not in {settings.unknown_value,value}: record.conflicts.append({"field":field,"rule_value":current.value,"ai_value":value}); record.review_status="待人工确认"
             setattr(record,field,ai_field)
-    if meta["cnc_systems"]: record.cnc_systems=meta["cnc_systems"]
-    if meta["knowledge_points"]: record.knowledge_points=[FieldValue(x,[]) for x in meta["knowledge_points"]]
-    if meta["keywords"]: record.keywords=meta["keywords"][:10]
+    if meta["cnc_systems"]:
+        record.cnc_systems=[{**item, "evidence":[asdict(source) for source in cited(item["evidence_refs"])]} for item in meta["cnc_systems"]]
+    if meta["knowledge_points"]: record.knowledge_points=[FieldValue(item["value"], cited(item["evidence_refs"])) for item in meta["knowledge_points"]]
+    if meta["keywords"]: record.keywords=[item["value"] for item in meta["keywords"][:10]]
+
+
+def _aggregate_ai_structured(record: Record) -> None:
+    """Merge equal records across chunks and explicitly flag contradictory ones."""
+    identity = {
+        "product_records": ("product_model", "product_name"),
+        "fault_records": ("machine_model", "alarm_code", "fault_symptom"),
+        "part_records": ("part_model", "drawing_number", "part_name"),
+        "business_rule_records": ("business_module", "rule_name"),
+    }
+    for key, items in record.ai_structured.items():
+        unique: dict[str, dict] = {}
+        for item in items:
+            signature = json.dumps({name:value for name, value in item.items() if name not in {"evidence_refs", "confidence"}}, ensure_ascii=False, sort_keys=True)
+            if signature in unique:
+                merged = unique[signature]
+                merged["evidence_refs"] = sorted(set(merged["evidence_refs"]) | set(item["evidence_refs"]))
+                merged["confidence"] = max(float(merged["confidence"]), float(item["confidence"]))
+            else:
+                unique[signature] = item
+        merged_items = list(unique.values())
+        record.ai_structured[key] = merged_items
+        by_identity: dict[tuple[str, ...], list[dict]] = {}
+        for item in merged_items:
+            token = tuple(item[name] for name in identity[key] if item[name] != "待人工确认")
+            if token: by_identity.setdefault(token, []).append(item)
+        for token, variants in by_identity.items():
+            variants_without_refs = {json.dumps({name:value for name, value in item.items() if name not in {"evidence_refs", "confidence"}}, ensure_ascii=False, sort_keys=True) for item in variants}
+            if len(variants_without_refs) > 1:
+                record.conflicts.append({"field":key, "rule_value":"分块结果", "ai_value":f"同一标识 {token} 存在冲突记录"})
+                record.review_status = "待人工确认"
 
 
 def analyze(path: Path, settings: Settings, analyzer: AIAnalyzer | None = None) -> Record:
@@ -181,7 +219,8 @@ def analyze(path: Path, settings: Settings, analyzer: AIAnalyzer | None = None) 
         record.summary, record.knowledge_points, record.keywords = summarize(parsed.text, parsed.evidence, settings)
         if analyzer:
             for chunk in parsed.chunks or [parsed.evidence]:
-                apply_ai(record, analyzer, "\n".join(item.excerpt for item in chunk), settings)
+                apply_ai(record, analyzer, "\n".join(item.excerpt for item in chunk), settings, chunk)
+            _aggregate_ai_structured(record)
         category = record.categories[0].name if record.categories else "待分类"; model = record.machine_models[0].value if record.machine_models else settings.unknown_value
         record.archive_suggestion = f"/{category}/{model}/{record.release_date.value if record.release_date else settings.unknown_value}"
     except Exception as exc:
@@ -194,7 +233,9 @@ def _tokens(text: str) -> set[str]: return {item.lower() for item in re.findall(
 
 def enrich(records: list[Record], settings: Settings, analyzer: AIAnalyzer | None = None) -> None:
     by_hash: dict[str, list[Record]] = {}; by_text: dict[str, list[Record]] = {}
-    for record in records: by_hash.setdefault(record.sha256, []).append(record); by_text.setdefault(record.normalized_text_hash, []).append(record)
+    for record in records:
+        by_hash.setdefault(record.sha256, []).append(record)
+        if record.normalized_text_hash: by_text.setdefault(record.normalized_text_hash, []).append(record)
     for group in by_hash.values():
         if len(group) > 1:
             for record in group: record.flags.append("完全重复文件（SHA-256）")
@@ -208,10 +249,10 @@ def enrich(records: list[Record], settings: Settings, analyzer: AIAnalyzer | Non
             for record in records: record.errors.append(f"语义向量不可用：{type(exc).__name__}")
     for index, left in enumerate(records):
         a = _tokens(left.text)
-        for right in records[index + 1:]:
+        for right_index, right in enumerate(records[index + 1:], index + 1):
             b = _tokens(right.text); score = len(a & b) / max(1, len(a | b))
             if vectors:
-                first, second = vectors[index], vectors[records.index(right)]
+                first, second = vectors[index], vectors[right_index]
                 dot = sum(x * y for x, y in zip(first, second)); left_norm = sum(x * x for x in first) ** .5; right_norm = sum(y * y for y in second) ** .5
                 score = dot / max(1e-12, left_norm * right_norm); label = "语义"
             else: label = "文本"
@@ -225,10 +266,10 @@ def enrich(records: list[Record], settings: Settings, analyzer: AIAnalyzer | Non
         versions = {item.version.value for item in group if item.version and item.version.value != settings.unknown_value}
         if len(versions) > 1:
             for item in group: item.flags.append("版本冲突：同类同型号存在多个版本")
-        dates = sorted(item.release_date.value for item in group if item.release_date and item.release_date.value != settings.unknown_value)
+        dates = sorted(((datetime.strptime(item.release_date.value.replace("/", "-").replace("年", "-").replace("月", "-").replace("日", ""), "%Y-%m-%d"), item) for item in group if item.release_date and item.release_date.value != settings.unknown_value and re.fullmatch(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{4}年\d{1,2}月\d{1,2}日?", item.release_date.value)), key=lambda pair: pair[0])
         if len(dates) > 1:
             for item in group:
-                if item.release_date and item.release_date.value == dates[0]: item.flags.append("疑似过期资料：存在较新发布日期")
+                if item.release_date and dates and item is dates[0][1]: item.flags.append("疑似过期资料：存在较新发布日期")
     for record in records:
         if not record.flags: record.flags.append("无")
 

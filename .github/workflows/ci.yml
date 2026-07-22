@@ -11,6 +11,7 @@ jobs:
       - run: pip install -r requirements.txt -r requirements-dev.txt
       - run: PYTHONPATH=. python -m unittest discover -s tests -v
       - run: PYTHONPATH=. python -m src.preprocessor --input examples --output outputs/ci --config config.json
+      - run: python tools/package.py
       - run: |
           python - <<'PY'
           import pathlib
@@ -21,7 +22,25 @@ jobs:
       - run: '! grep -R --include="*.py" --include="*.json" -E "sk-[A-Za-z0-9]{12,}|ghp_[A-Za-z0-9]{20,}" .'
       - run: |
           python - <<'PY'
-          import zipfile
-          with zipfile.ZipFile('package-smoke.zip', 'w') as z: z.write('README.md')
-          with zipfile.ZipFile('package-smoke.zip') as z: assert z.namelist() == ['README.md']
+          import pathlib, zipfile
+          z=zipfile.ZipFile('dist/fastgpt-file-preprocessor.zip'); names=set(z.namelist())
+          required={
+              'fastgpt-file-preprocessor/src/preprocessor.py',
+              'fastgpt-file-preprocessor/requirements.txt',
+              'fastgpt-file-preprocessor/requirements-dev.txt',
+              'fastgpt-file-preprocessor/config.json',
+              'fastgpt-file-preprocessor/run.ps1',
+              'fastgpt-file-preprocessor/README.md',
+          }
+          assert required <= names, sorted(required - names)
+          z.extractall('package-test')
+          assert pathlib.Path('package-test/fastgpt-file-preprocessor/src/preprocessor.py').exists()
           PY
+      - run: |
+          python -m venv package-test/.venv
+          package-test/.venv/bin/python -m pip install -r package-test/fastgpt-file-preprocessor/requirements.txt
+          mkdir -p package-test/input
+          printf 'BK5030 产品参数 版本：V1.2 发布日期：2025-01-01' > package-test/input/smoke.txt
+          cd package-test/fastgpt-file-preprocessor
+          ../.venv/bin/python -m src.preprocessor --input ../input --output ../smoke-output --config config.json
+          test -f ../smoke-output/analysis.json

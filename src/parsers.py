@@ -32,7 +32,7 @@ class Extracted:
 
 def evidence(source: str, location: str, excerpt: str) -> Evidence:
     token = hashlib.sha256(f"{source}|{location}|{excerpt}".encode("utf-8")).hexdigest()[:16]
-    return Evidence(token, source, location, excerpt[:1200])
+    return Evidence(token, source, location, excerpt)
 
 
 def sha256(path: Path) -> str:
@@ -48,16 +48,18 @@ def extract(path: Path, settings: Settings) -> Extracted:
     suffix = path.suffix.lower()
     if suffix in {".txt", ".md", ".markdown"}:
         text = path.read_text(encoding="utf-8", errors="replace")
-        result = Extracted(text, [evidence(path.name, "正文", text)]); result.chunks = [result.evidence]; return result
+        items=[evidence(path.name, f"正文分块 {i//settings.chunk_size_chars+1}", text[i:i+settings.chunk_size_chars]) for i in range(0,len(text),max(1,settings.chunk_size_chars-settings.chunk_overlap_chars))] or [evidence(path.name,"正文","")]
+        result = Extracted(text, items); result.chunks = [[item] for item in items]; return result
     if suffix == ".pdf": return _pdf(path, settings)
-    if suffix == ".docx": return _docx(path)
-    if suffix in {".xlsx", ".xlsm"}: return _xlsx(path)
-    if suffix == ".pptx": return _pptx(path)
+    if suffix == ".docx": return _docx(path, settings)
+    if suffix in {".xlsx", ".xlsm"}: return _xlsx(path, settings)
+    if suffix == ".pptx": return _pptx(path, settings)
     if suffix in {".doc", ".xls", ".ppt"}:
         if not settings.legacy_office_conversion_enabled: return Extracted("", errors=["旧版 Office 文件需安全转换"], ocr_attempted=False)
         from .legacy_office import extract_legacy_readonly
         text = extract_legacy_readonly(path, settings.legacy_office_timeout_seconds)
-        result = Extracted(text, [evidence(path.name, "安全转换正文", text)]); result.chunks = [result.evidence]; return result
+        items = [evidence(path.name, f"安全转换正文 {index // max(1, settings.chunk_size_chars - settings.chunk_overlap_chars) + 1}", text[index:index + settings.chunk_size_chars]) for index in range(0, len(text), max(1, settings.chunk_size_chars - settings.chunk_overlap_chars))] or [evidence(path.name, "安全转换正文", "")]
+        result = Extracted(text, items); result.chunks = [[item] for item in items]; return result
     return Extracted("", errors=[f"不支持的文件类型：{suffix}"])
 
 
@@ -73,10 +75,10 @@ def _pdf(path: Path, settings: Settings) -> Extracted:
     if len(result.text.strip()) < settings.min_pdf_text_chars:
         result.ocr_attempted = True; result.ocr_status = "待视觉识别"
         result.errors.append("PDF 有效文字过少；视觉 OCR 未配置或未完成，未提取 OCR 文字")
-    result.chunks = [[item] for item in result.evidence]; return result
+    result.chunks = _chunk_evidence(result.evidence, settings.chunk_size_chars, settings.chunk_overlap_chars); return result
 
 
-def _docx(path: Path) -> Extracted:
+def _docx(path: Path, settings: Settings) -> Extracted:
     from docx import Document
     document = Document(path); result = Extracted(""); pieces = []
     for i, paragraph in enumerate(document.paragraphs, 1):
@@ -90,10 +92,10 @@ def _docx(path: Path) -> Extracted:
         rows = [[cell.text.strip() for cell in row.cells] for row in table.rows]
         result.tables.append({"source": path.name, "location": f"Word 表格 {index}", "rows": rows})
         pieces.extend(" | ".join(row) for row in rows)
-    result.text = "\n".join(pieces); result.chunks = _chunk_evidence(result.evidence, settings_chunk := 12000); return result
+    result.text = "\n".join(pieces); result.chunks = _chunk_evidence(result.evidence, settings.chunk_size_chars, settings.chunk_overlap_chars); return result
 
 
-def _xlsx(path: Path) -> Extracted:
+def _xlsx(path: Path, settings: Settings) -> Extracted:
     from openpyxl import load_workbook
     book = load_workbook(path, read_only=True, data_only=True); result = Extracted(""); pieces = []
     try:
@@ -103,25 +105,34 @@ def _xlsx(path: Path) -> Extracted:
             for number, row in enumerate(rows, 1):
                 line = " | ".join(row).strip()
                 if line: pieces.append(line); result.evidence.append(evidence(path.name, f"工作表 {sheet.title} 第{number}行", line))
-        result.text = "\n".join(pieces); result.chunks = _chunk_evidence(result.evidence, 12000); return result
+        result.text = "\n".join(pieces); result.chunks = _chunk_evidence(result.evidence, settings.chunk_size_chars, settings.chunk_overlap_chars); return result
     finally:
         book.close()
 
 
-def _pptx(path: Path) -> Extracted:
+def _pptx(path: Path, settings: Settings) -> Extracted:
     from pptx import Presentation
     result = Extracted(""); pieces = []
     for number, slide in enumerate(Presentation(path).slides, 1):
         values = [shape.text.strip() for shape in slide.shapes if hasattr(shape, "text") and shape.text.strip()]
         text = "\n".join(values)
         if text: pieces.append(text); result.evidence.append(evidence(path.name, f"PPT 第{number}页", text))
-    result.text = "\n".join(pieces); result.chunks = [[item] for item in result.evidence]; return result
+    result.text = "\n".join(pieces); result.chunks = _chunk_evidence(result.evidence, settings.chunk_size_chars, settings.chunk_overlap_chars); return result
 
 
-def _chunk_evidence(items: list[Evidence], size: int) -> list[list[Evidence]]:
-    groups: list[list[Evidence]] = []; current: list[Evidence] = []; count = 0
+def _chunk_evidence(items: list[Evidence], size: int, overlap: int = 0) -> list[list[Evidence]]:
+    # A single long paragraph/cell/page must not bypass the configured chunk size.
+    expanded: list[Evidence] = []
+    stride = max(1, size - overlap)
     for item in items:
+        if len(item.excerpt) <= size:
+            expanded.append(item); continue
+        for start in range(0, len(item.excerpt), stride):
+            expanded.append(evidence(item.source, f"{item.location} 片段 {start // stride + 1}", item.excerpt[start:start + size]))
+    groups: list[list[Evidence]] = []; current: list[Evidence] = []; count = 0
+    for item in expanded:
         if current and count + len(item.excerpt) > size:
-            groups.append(current); current = []; count = 0
+            groups.append(current); current = current[-1:] if overlap else []; count = sum(len(x.excerpt) for x in current)
         current.append(item); count += len(item.excerpt)
-    return groups or ([items] if items else [])
+    if current: groups.append(current)
+    return groups or ([expanded] if expanded else [])

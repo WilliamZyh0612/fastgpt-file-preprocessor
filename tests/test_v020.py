@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from dataclasses import asdict
 
 from docx import Document
 from openpyxl import Workbook
@@ -11,7 +12,7 @@ from reportlab.pdfgen import canvas
 
 from src.ai import AIAnalyzer, AIResponseError
 from src.config import Settings, load_settings
-from src.parsers import extract
+from src.parsers import evidence, extract
 from src.preprocessor import REVIEW_PENDING, analyze, run, split_sentences
 
 
@@ -85,9 +86,12 @@ class V020Tests(unittest.TestCase):
         def delayed(_):
             calls["count"] += 1
             if calls["count"] < 2: raise TimeoutError("timeout")
-            data={"document_metadata":{"categories":[],"machine_models":[],"cnc_systems":[],"visibility":"待人工确认","version":"待人工确认","release_date":"待人工确认","summary":"x","knowledge_points":[],"keywords":[]},"product_records":[],"fault_records":[],"part_records":[],"business_rule_records":[]}
+            ref = json.loads(_["messages"][1]["content"])["evidence"][0]["evidence_id"]
+            field = lambda value: {"value":value,"confidence":.8,"evidence_refs":[ref]}
+            data={"document_metadata":{"categories":[],"machine_models":[],"cnc_systems":[],"visibility":field("待人工确认"),"version":field("待人工确认"),"release_date":field("待人工确认"),"summary":field("x"),"knowledge_points":[],"keywords":[]},"product_records":[],"fault_records":[],"part_records":[],"business_rule_records":[]}
             return {"choices": [{"message": {"content": json.dumps(data)}}]}
-        self.assertEqual(AIAnalyzer(Settings(ai_enabled=True, api_base_url="http://test/v1", text_model="test", retries=1), delayed).analyze("text")["document_metadata"]["summary"], "x")
+        source = evidence("test.txt", "正文", "text")
+        self.assertEqual(AIAnalyzer(Settings(ai_enabled=True, api_base_url="http://test/v1", text_model="test", retries=1), delayed).analyze("text", [asdict(source)])["document_metadata"]["summary"]["value"], "x")
         self.assertEqual(calls["count"], 2)
 
     def test_legacy_office_requires_safe_conversion(self):
